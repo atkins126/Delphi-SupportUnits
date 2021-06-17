@@ -29,8 +29,8 @@ This unit does not depend on a specific Delphi memory manager and is therefore c
 This unit can be used by Delphi programs to verify correct management of heap memory. From the point of view of the program,
 only the speed is adversely affected and more memory is used.
 
-It provides checks for Delphi and COM memory allocations (detection of double-free and of corruption by writing before the start or
-past the end of allocated blocks).
+It provides checks for Delphi and COM memory allocations: Detection of double-free and of corruption by writing before the start or
+past the end of allocated blocks.
 For Delphi memory, it also detects memory leaks and reports them at program exit.
 
 Example:
@@ -66,7 +66,7 @@ Addr: 000000008000ef10  Size: 18  Type: AnsiString
   000000008000ef20 61 00                                            a.              
 ```
 
-Aother example:
+Another example:
 ```
 var
   p: PByte;
@@ -77,7 +77,7 @@ begin
 end.
 ```
 
-The call to CoTaskMemFree will generate a Debugger break (if running under a debugger) and displays this line the Event Log window of the IDE:
+The call to CoTaskMemFree will generate a Debugger break (if running under a debugger) and displays this line in the Event Log window of the IDE:
 ```
 Debug output: *** COM Memory: Memory corruption detected: p=$000000008000ef60 Prozess Test.exe (7548)
 ```
@@ -98,6 +98,8 @@ Simple replacement for the built-in Delphi memory manager, by using the Windows 
 
 (I care for thread-safety and low fragmentation, but not so much for ultimate performance. As the Windows heap is used by most
 Visual C/C++ programs through the standard malloc implementation in msvcrt.dll, it should be fine for this requirements.)
+
+It is perhaps worth mentioning that using it with my Tasks demo (see the Delphi-Tasks repository) significantly increases the performance (12.5 to 5.8 seconds, with 24 cores). I wasn't expecting that and it took me a while to find out where the difference comes from. Maybe its due to some alignment or cache-line effects, or maybe the implementation is simply better.
 
 
 ## CorrectLocale
