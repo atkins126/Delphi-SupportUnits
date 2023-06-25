@@ -2,7 +2,9 @@ unit MemTest;
 
 {
   This unit can be integrated into programs to verify correct memory management. From the point of view of the program,
-  only the speed is adversely affected and more memory is used.
+  only the speed is adversely affected and more memory is used. If the application attempts to call FreeMem or
+  ReallocMem with an invalid pointer, an error is written to the console window (if any) or to a trace file, and the
+  process terminates without the call returning.
 
   The complete functionality is controlled by the precompiler symbol MEMTEST_ACTIVE:
   - MEMTEST_ACTIVE is undefined (Release builds): Memory allocations are not intercepted in any way.
@@ -70,9 +72,9 @@ type
 	Title: PAnsiChar;
 
 	ExpectedMemInbalance: _NativeUInt;		// Memory that is expected to be not released at the end of the program
-	AllocMemSize: _NativeUInt;				// currently allocated bytes (without MemManager overhead)
+	AllocMemSize: _NativeUInt;				// currently allocated bytes (without the added overhead)
 	AllocMemBlocks: _NativeUInt;			// currently allocated blocks
-	MaxAllocMemSize: _NativeUInt;			// previous maximum value of MyAllocMemSize
+	MaxAllocMemSize: _NativeUInt;			// previous maximum value of AllocMemSize
 
 	AllocBreakAddr: pointer;				// triggers debug-break if this address is returned by GetMem or Realloc
 	FreeBreakAddr: pointer;					// triggers debug-break stop if this address is passed to Free or Realloc
@@ -96,11 +98,12 @@ var
 	FreeBreakSize: High(_NativeUInt);
   );
 
-  // as to whether a debug-break should be triggered in the event of alloc errors (e.g. out of memory):
+  // as to whether a debug-break should be triggered in the event of alloc errors (e.g. out of memory) in GetMem or
+  // ReallocMem:
   MyBreakOnAllocationError: boolean;
 
 
-procedure DumpAllocatedBlocks(const Filename: string);
+procedure DumpAllocatedBlocks(const Filename: string; WithHexDump: boolean = true);
 function IsMemoryValid: boolean;
 
 
@@ -108,8 +111,9 @@ function IsMemoryValid: boolean;
 implementation
 {############################################################################}
 
-uses Windows, WinSlimLock;
+{$ifdef MEMTEST_ACTIVE}
 
+uses Windows, WinSlimLock;
 
 //==================================================================================================================================
 //== Functions for outputting trace information
@@ -286,8 +290,6 @@ begin
 end;
 
 
-{$ifdef MEMTEST_ACTIVE}
-
  //===================================================================================================================
  //== Replacement functions for GetMem/FreeMem with added consistency checks and book-keeping
  //===================================================================================================================
@@ -318,7 +320,7 @@ type
 	function Dequeue(Payload: pointer): PPreRec;
 
 	function IsValidList: boolean;
-	procedure DumpList(Filename: PChar; DoLock, CheckForDelphiClasses: boolean);
+	procedure DumpList(Filename: PChar; DoLock, CheckForDelphiClasses, WithHexDump: boolean);
 	procedure CheckMemoryLeak(IsDelphiMem: boolean);
 	procedure MemErr(p: PPreRec);
 	class function IsValidBlock(P: PPreRec): boolean; static;
@@ -356,6 +358,18 @@ var
 	FStats: @ComMemStats;
   );
 
+  function IsDebuggerPresent: BOOL; stdcall; external Windows.kernel32 name 'IsDebuggerPresent';
+
+
+ //===================================================================================================================
+ // Cause a break into the debugger. Does nothing when not debugged.
+ //===================================================================================================================
+procedure MyDebugBreak;
+begin
+  // In the past, DebugBreak got ignored when not being debugged. Now it terminates the process.
+  if IsDebuggerPresent then Windows.DebugBreak;
+end;
+
 
  //===================================================================================================================
  // Outputs the texts in <Strs> on stderr and in the Windows debug output, and triggers a debugger break.
@@ -373,9 +387,9 @@ begin
 	WriteStrToFile(h, [Buf, CrLf]);
   end;
 
-  // Output in the EventLog window of the Delphi IDE (or any other debugger):
+  // posts the message to the EventLog window of the Delphi IDE (or any other debugger):
   Windows.OutputDebugStringA(@Buf[1]);
-  Windows.DebugBreak;
+  MyDebugBreak;
 end;
 
 
@@ -390,7 +404,7 @@ begin
 
   if PP = nil then begin
 	if MyBreakOnAllocationError then
-	  Windows.DebugBreak;
+	  MyDebugBreak;
 	exit(nil);
   end;
 
@@ -452,38 +466,41 @@ end;
  //===================================================================================================================
 function MyReallocMem(P: Pointer; _Size: _NativeInt): Pointer;
 var
-  Size: _NativeUInt absolute _Size;
-  PP: PPreRec;
+  NewSize: _NativeUInt absolute _Size;
   OldSize: _NativeUInt;
+  NewPP: PPreRec;
+  OldPP: PPreRec;
 begin
   // Delphi never passes nil and always passes positive values:
   // (means: ReallocMem() from zero to non-zero size is done as GetMem(), and ReallocMem() from non-zero to zero size
   // is done as FreeMem().)
   Assert((P <> nil) and (_Size > 0));
 
-  PP := DelphiMem.Dequeue( P );
+  OldPP := DelphiMem.Dequeue( P );
 
-  OldSize := PP^.Size;
+  OldSize := OldPP^.Size;
 
-  if Size < OldSize then begin
+  if NewSize < OldSize then begin
 	// overwrite the released memory, including the old TPostRec data:
-	FillChar((PByte(PP) + sizeof(TPreRec) + Size)^, (OldSize - Size) + sizeof(TPostRec), MyFreeFillByte);
+	FillChar((PByte(OldPP) + sizeof(TPreRec) + NewSize)^, (OldSize - NewSize) + sizeof(TPostRec), MyFreeFillByte);
   end;
 
-  PP := OldMgr.ReallocMem(PP, Size + sizeof(TPreRec) + sizeof(TPostRec));
+  NewPP := OldMgr.ReallocMem(OldPP, NewSize + sizeof(TPreRec) + sizeof(TPostRec));
 
-  if PP = nil then begin
+  if NewPP = nil then begin
+	// not relocated due to some error => enqueue the orginal block:
+	DelphiMem.Enqueue( OldPP, OldSize );
 	if MyBreakOnAllocationError then
-	  Windows.DebugBreak;
+	  MyDebugBreak;
 	exit(nil);
   end;
 
-  // enqueue the block:
-  Result := DelphiMem.Enqueue( PP, Size );
+  // enqueue the relocated block:
+  Result := DelphiMem.Enqueue( NewPP, NewSize );
 
-  if Size > OldSize then begin
+  if NewSize > OldSize then begin
 	// fill the newly allocated memory:
-	FillChar((PByte(Result) + OldSize)^, Size - OldSize, MyAllocFillByte);
+	FillChar((PByte(Result) + OldSize)^, NewSize - OldSize, MyAllocFillByte);
   end;
 end;
 
@@ -522,7 +539,7 @@ end;
 
 
  //===================================================================================================================
- // Chain <Block> to FList.Next. Update statistics. Return pointer to the Payload area of <Block>:
+ // Chain <Block> to FList. Update statistics. Return pointer to the payload area of <Block>:
  //===================================================================================================================
 function TBlockList.Enqueue(Block: PPreRec; Size: _NativeUInt): pointer;
 begin
@@ -549,24 +566,24 @@ begin
   Result := PByte(Block) + sizeof(TPreRec);
 
   if (Result = FStats.AllocBreakAddr) or (Size = FStats.AllocBreakSize) then
-	Windows.DebugBreak;
+	MyDebugBreak;
 end;
 
 
  //===================================================================================================================
- // Unchain <Block>. Update statistics. Return pointer to the TPreRect data.
- // If the block is damaged, a message is issued, trace file output is generated and the process is killed.
+ // Unchain <Payload>. Update statistics. Return pointer to the TPreRect data.
+ // If the block is invalid, a message is issued, trace file output is generated and the process is killed.
  //===================================================================================================================
 function TBlockList.Dequeue(Payload: pointer): PPreRec;
 begin
   Result := PPreRec(PByte(Payload) - sizeof(TPreRec));
 
   if (Payload = FStats.FreeBreakAddr) or (Result^.Size = FStats.FreeBreakSize) then
-	Windows.DebugBreak;
+	MyDebugBreak;
 
   FLock.AcquireExclusive;
 
-	// IsValidBlock tests the Prev and Next pointers, which could be alterted by other threads in parallel
+	// IsValidBlock tests the Prev and Next pointers, which could be modified in parallel by other threads.
 	// => the check must be done within the lock
 
 	if not self.IsValidBlock(Result) then begin
@@ -620,7 +637,7 @@ end;
  // - Delphi class: "<ClassName>"
  // - other: "-"
  //===================================================================================================================
-procedure TBlockList.DumpList(Filename: PChar; DoLock, CheckForDelphiClasses: boolean);
+procedure TBlockList.DumpList(Filename: PChar; DoLock, CheckForDelphiClasses, WithHexDump: boolean);
 type
   // from System.pas
   PStrRec = ^TStrRec;
@@ -735,17 +752,20 @@ begin
 	  end;
 
 	  WriteStrToFile(hFile, ['Addr: ', PtrToHex(q), '  Size: ', NUIntToStr(p^.Size), '  Type: ', ClassName, CrLf]);
-	  if p^.Size <= MaxDumpSize then begin
-		// dump whole block:
-		WriteHexDump(hFile, q, p^.Size);
-	  end
-	  else begin
-		// dump only beginning and end of block:
-		WriteHexDump(hFile, q, MaxDumpSize div 2);
-		WriteStrToFile(hFile, ['           .................' + CrLf]);
-		WriteHexDump(hFile, q + p^.Size - MaxDumpSize div 2, MaxDumpSize div 2);
+
+	  if WithHexDump then begin
+		if p^.Size <= MaxDumpSize then begin
+		  // dump whole block:
+		  WriteHexDump(hFile, q, p^.Size);
+		end
+		else begin
+		  // dump only beginning and end of block:
+		  WriteHexDump(hFile, q, MaxDumpSize div 2);
+		  WriteStrToFile(hFile, ['           .................' + CrLf]);
+		  WriteHexDump(hFile, q + p^.Size - MaxDumpSize div 2, MaxDumpSize div 2);
+		end;
+		WriteStrToFile(hFile, [CrLf]);
 	  end;
-	  WriteStrToFile(hFile, [CrLf]);
 
 	  p := p^.Next;
 	end;
@@ -767,7 +787,7 @@ var
   q: PPostRec;
 begin
   SignalError([FStats.Title, ' Memory corruption detected: p=$', PtrToHex(p)]);
-  Windows.DebugBreak;
+  MyDebugBreak;
 
   hFile := Windows.CreateFile('memdump_corrupt_block.txt', FILE_APPEND_DATA, FILE_SHARE_READ or FILE_SHARE_WRITE or FILE_SHARE_DELETE, nil, OPEN_ALWAYS, 0, 0);
   if hFile <> INVALID_HANDLE_VALUE then begin
@@ -798,7 +818,7 @@ procedure TBlockList.CheckMemoryLeak(IsDelphiMem: boolean);
 begin
   if (FStats.AllocMemSize > FStats.ExpectedMemInbalance) or (FStats.ExpectedMemInbalance = 0) and (FStats.AllocMemBlocks <> 0) then begin
 	SignalError([FStats.Title, ' Memory still allocated: ', NUIntToStr(FStats.AllocMemSize), ' byte in ', NUIntToStr(FStats.AllocMemBlocks) , ' blocks']);
-	self.DumpList('memdump_allocated_blocks.txt', false, IsDelphiMem);
+	self.DumpList('memdump_allocated_blocks.txt', false, IsDelphiMem, true);
   end
   else if FStats.AllocMemSize < FStats.ExpectedMemInbalance then begin
 	SignalError([FStats.Title, ' Memory imbalance detected: ', NUIntToStr(FStats.AllocMemSize), ' <> ', NUIntToStr(FStats.ExpectedMemInbalance)]);
@@ -821,9 +841,9 @@ end;
  // Appends a dump of all allocated memory blocks to the given file.
  // This temporarly blocks all other threads on doing heap operations.
  //===================================================================================================================
-procedure DumpAllocatedBlocks(const Filename: string);
+procedure DumpAllocatedBlocks(const Filename: string; WithHexDump: boolean);
 begin
-  DelphiMem.DumpList(PChar(Filename), true, true);
+  DelphiMem.DumpList(PChar(Filename), true, true, WithHexDump);
 end;
 
 
@@ -851,16 +871,56 @@ type
 	procedure PostHeapMinimize; stdcall;
   end;
 
+  IInitializeSpy = interface(IUnknown)
+	['{00000034-0000-0000-C000-000000000046}']
+	function PreInitialize(dwCoInit: DWORD; dwCurThreadAptRefs: DWORD): HRESULT; stdcall;
+	function PostInitialize(hrCoInit: HRESULT; dwCoInit: DWORD; dwNewThreadAptRefs: DWORD): HRESULT; stdcall;
+	function PreUninitialize(dwCurThreadAptRefs: DWORD): HRESULT; stdcall;
+	function PostUninitialize(dwNewThreadAptRefs: DWORD): HRESULT; stdcall;
+  end;
+
 const
   ole32 = 'ole32.dll';
+  oleaut32 = 'oleaut32.dll';
 
 function IsEqualGUID(const guid1, guid2: TGUID): Boolean; stdcall; external ole32 name 'IsEqualGUID';
 function CoRegisterMallocSpy(mallocSpy: IMallocSpy): HResult; stdcall; external ole32 name 'CoRegisterMallocSpy';
 function CoRevokeMallocSpy: HResult stdcall; external ole32 name 'CoRevokeMallocSpy';
-procedure SetOaNoCache; cdecl; external 'oleaut32.dll' name 'SetOaNoCache';
+procedure SetOaNoCache; cdecl; external oleaut32 name 'SetOaNoCache';
+function CoRegisterInitializeSpy(pSpy: IInitializeSpy; out puliCookie: ULARGE_INTEGER): HRESULT; stdcall; external ole32 name 'CoRegisterInitializeSpy';
+function CoRevokeInitializeSpy(uliCookie: ULARGE_INTEGER): HRESULT; stdcall; external ole32 name 'CoRevokeInitializeSpy';
+
+type
+  // structure to implement IMallocSpy as a singleton object:
+  TComAllocSpy = record
+  strict private
+	var
+	  FVMT: pointer;
+
+	function QueryInterface(const IID: TGUID; out Obj: pointer): HResult; stdcall;
+	function AddRef: Integer; stdcall;
+	function Release: Integer; stdcall;
+	function PreAlloc(cbRequest: SIZE_T): SIZE_T; stdcall;
+	function PostAlloc(pActual: Pointer): Pointer; stdcall;
+	function PreFree(pRequest: Pointer; fSpyed: BOOL): Pointer; stdcall;
+	procedure PostFree(fSpyed: BOOL); stdcall;
+	function PreRealloc(pRequest: Pointer; NewSize: SIZE_T; out ppNewRequest: Pointer; fSpyed: BOOL): SIZE_T; stdcall;
+	function PostRealloc(pActual: Pointer; fSpyed: BOOL): Pointer; stdcall;
+	function PreGetSize(pRequest: Pointer; fSpyed: BOOL): Pointer; stdcall;
+	function PostGetSize(cbActual: SIZE_T; fSpyed: BOOL): SIZE_T; stdcall;
+	function PreDidAlloc(pRequest: Pointer; fSpyed: BOOL): Pointer; stdcall;
+	function PostDidAlloc(pRequest: Pointer; fSpyed: BOOL; fActual: Integer): Integer; stdcall;
+	procedure NoopHeapMinimize; stdcall;
+  public
+	class procedure Init; static; inline;
+	class procedure Fini; static; inline;
+  end;
+
+threadvar
+  gRequestedSize: _NativeUInt;
 
 
-{ TMallocSpy }
+{ TComAllocSpy }
 
 // All allocations and releases are still performed by the original COM allocator.
 //
@@ -870,10 +930,10 @@ procedure SetOaNoCache; cdecl; external 'oleaut32.dll' name 'SetOaNoCache';
 
  //===================================================================================================================
  //===================================================================================================================
-function Spy_QueryInterface(self: Pointer; const IID: TGUID; out Obj: pointer): HResult; stdcall;
+function TComAllocSpy.QueryInterface(const IID: TGUID; out Obj: pointer): HResult;
 begin
   if IsEqualGUID(IID, IMallocSpy) then begin
-	Obj := self;
+	Obj := @self;
 	Result := S_OK;
   end
   else begin
@@ -886,7 +946,7 @@ end;
  //===================================================================================================================
  // Not called because we don't use it in QueryInterface.
  //===================================================================================================================
-function Spy_AddRef(self: Pointer): Integer; stdcall;
+function TComAllocSpy.AddRef: Integer;
 begin
   Result := 1;
 end;
@@ -896,15 +956,11 @@ end;
  // This is called during CoRevokeMallocSpy or (when there are outstanding "spyed" allocations) after the last
  // allocation is released. Maybe called *during* ExitProcess.
  //===================================================================================================================
-function Spy_Release(self: Pointer): Integer; stdcall;
+function TComAllocSpy.Release: Integer;
 begin
   Assert(ComMem.FStats.AllocMemBlocks = 0);
   Result := 0;
 end;
-
-
-threadvar
-  gRequestedSize: _NativeUInt;
 
 
  //===================================================================================================================
@@ -912,7 +968,7 @@ threadvar
  // However, when the actual allocation encounters a real memory failure and returns NULL, PostAlloc is called.
  // Result = byte count to be passed to underlying allocator
  //===================================================================================================================
-function Spy_PreAlloc(self: Pointer; cbRequest: SIZE_T): SIZE_T; stdcall;
+function TComAllocSpy.PreAlloc(cbRequest: SIZE_T): SIZE_T;
 begin
   gRequestedSize := cbRequest;
 
@@ -920,7 +976,7 @@ begin
 end;
 
  // Result = pointer to be returned by IMalloc::Alloc
-function Spy_PostAlloc(self: Pointer; pActual: Pointer): Pointer; stdcall;
+function TComAllocSpy.PostAlloc(pActual: Pointer): Pointer;
 begin
   Result := pActual;
 
@@ -931,7 +987,7 @@ begin
 	FillChar(Result^, gRequestedSize, MyAllocFillByte);
   end
   else if MyBreakOnAllocationError then begin
-	Windows.DebugBreak;
+	MyDebugBreak;
   end;
 end;
 
@@ -939,7 +995,7 @@ end;
  //===================================================================================================================
  // Result = pointer to be passed to underlying allocator
  //===================================================================================================================
-function Spy_PreFree(self: Pointer; pRequest: Pointer; fSpyed: BOOL): Pointer; stdcall;
+function TComAllocSpy.PreFree(pRequest: Pointer; fSpyed: BOOL): Pointer;
 begin
   Result := pRequest;
   if fSpyed and (Result <> nil) then begin
@@ -950,7 +1006,7 @@ begin
   end;
 end;
 
-procedure Spy_PostFree(self: Pointer; fSpyed: BOOL); stdcall;
+procedure TComAllocSpy.PostFree(fSpyed: BOOL);
 begin
 end;
 
@@ -959,13 +1015,18 @@ end;
  // ppNewRequest = pointer to be passed to underlying allocator
  // Result = byte count to be passed to underlying allocator
  //===================================================================================================================
-function Spy_PreRealloc(self: Pointer; pRequest: Pointer; NewSize: SIZE_T; out ppNewRequest: Pointer; fSpyed: BOOL): SIZE_T; stdcall;
+function TComAllocSpy.PreRealloc(pRequest: Pointer; NewSize: SIZE_T; out ppNewRequest: Pointer; fSpyed: BOOL): SIZE_T;
 var
   OldSize: _NativeUInt;
 begin
+  if not fSpyed then begin
+	ppNewRequest := pRequest;
+	exit(NewSize);
+  end;
+
   gRequestedSize := NewSize;
 
-  if fSpyed and (pRequest <> nil) then begin
+  if pRequest <> nil then begin
 
 	pRequest := ComMem.Dequeue(pRequest);
 	OldSize := PPreRec(pRequest)^.Size;
@@ -981,27 +1042,31 @@ begin
 end;
 
  // Result = pointer to be returned by IMalloc::Relloc
-function Spy_PostRealloc(self: Pointer; pActual: Pointer; fSpyed: BOOL): Pointer; stdcall;
+function TComAllocSpy.PostRealloc(pActual: Pointer; fSpyed: BOOL): Pointer;
 var
   NewSize: _NativeUInt;
   OldSize: _NativeUInt;
 begin
   Result := pActual;
 
-  // nil only occurs if COM could not allocate memory (out-of-memory):
-  if Result <> nil then begin
-	OldSize := PPreRec(Result)^.Size;
-	NewSize := gRequestedSize;
+  if fSpyed then begin
 
-	Result := ComMem.Enqueue(Result, NewSize);
+	// nil only occurs if COM could not allocate memory (out-of-memory):
+	if Result <> nil then begin
+	  OldSize := PPreRec(Result)^.Size;
+	  NewSize := gRequestedSize;
 
-	if NewSize > OldSize then begin
-	  // fill the newly allocated memory:
-	  FillChar((PByte(Result) + OldSize)^, NewSize - OldSize, MyAllocFillByte);
+	  Result := ComMem.Enqueue(Result, NewSize);
+
+	  if NewSize > OldSize then begin
+		// fill the newly allocated memory:
+		FillChar((PByte(Result) + OldSize)^, NewSize - OldSize, MyAllocFillByte);
+	  end;
+	end
+	else if MyBreakOnAllocationError then begin
+	  MyDebugBreak;
 	end;
-  end
-  else if MyBreakOnAllocationError then begin
-	Windows.DebugBreak;
+
   end;
 end;
 
@@ -1009,14 +1074,14 @@ end;
  //===================================================================================================================
  // Result = pointer to be passed to underlying allocator
  //===================================================================================================================
-function Spy_PreGetSize(self: Pointer; pRequest: Pointer; fSpyed: BOOL): Pointer; stdcall;
+function TComAllocSpy.PreGetSize(pRequest: Pointer; fSpyed: BOOL): Pointer;
 begin
   Result := pRequest;
   if fSpyed then Result := PByte(Result) - sizeof(TPreRec);
 end;
 
  // Result = byte count to be returned by IMalloc::GetSize
-function Spy_PostGetSize(self: Pointer; cbActual: SIZE_T; fSpyed: BOOL): SIZE_T; stdcall;
+function TComAllocSpy.PostGetSize(cbActual: SIZE_T; fSpyed: BOOL): SIZE_T;
 begin
   Result := cbActual;
   if fSpyed then Result := Result - sizeof(TPreRec) - sizeof(TPostRec);
@@ -1026,23 +1091,73 @@ end;
  //===================================================================================================================
  // Result = pointer to be passed to underlying allocator
  //===================================================================================================================
-function Spy_PreDidAlloc(self: Pointer; pRequest: Pointer; fSpyed: BOOL): Pointer; stdcall;
+function TComAllocSpy.PreDidAlloc(pRequest: Pointer; fSpyed: BOOL): Pointer;
 begin
   Result := pRequest;
   if fSpyed then Result := PByte(Result) - sizeof(TPreRec);
 end;
 
  // Result = value to be returned by IMalloc::DidAlloc (-1, 0, +1)
-function Spy_PostDidAlloc(self: Pointer; pRequest: Pointer; fSpyed: BOOL; fActual: Integer): Integer; stdcall;
+function TComAllocSpy.PostDidAlloc(pRequest: Pointer; fSpyed: BOOL; fActual: Integer): Integer;
 begin
   Result := fActual;
 end;
 
 
  //===================================================================================================================
+ // do nothing
  //===================================================================================================================
-procedure Spy_NoopHeapMinimize(self: Pointer); stdcall;
+procedure TComAllocSpy.NoopHeapMinimize;
 begin
+end;
+
+
+ //===================================================================================================================
+ // install COM memory monitoring:
+ //===================================================================================================================
+class procedure TComAllocSpy.Init;
+const
+  VMT: array [0..14] of Pointer =
+  (
+	@TComAllocSpy.QueryInterface,
+	@TComAllocSpy.AddRef,
+	@TComAllocSpy.Release,
+	@TComAllocSpy.PreAlloc,
+	@TComAllocSpy.PostAlloc,
+	@TComAllocSpy.PreFree,
+	@TComAllocSpy.PostFree,
+	@TComAllocSpy.PreRealloc,
+	@TComAllocSpy.PostRealloc,
+	@TComAllocSpy.PreGetSize,
+	@TComAllocSpy.PostGetSize,
+	@TComAllocSpy.PreDidAlloc,
+	@TComAllocSpy.PostDidAlloc,
+	@TComAllocSpy.NoopHeapMinimize,		// IMallocSpy.PreHeapMinimize
+	@TComAllocSpy.NoopHeapMinimize		// IMallocSpy.PostHeapMinimize
+  );
+
+  // static singleton COM object:
+  Obj: TComAllocSpy = (FVMT: @VMT);
+begin
+  // install COM memory monitoring:
+  CoRegisterMallocSpy(IMallocSpy(@Obj));
+
+  // turn off the BSTR cache in oleaut32.dll (runs slower, but makes allocations deterministic):
+  // https://devblogs.microsoft.com/oldnewthing/20150107-00/?p=43203
+  SetOaNoCache;
+end;
+
+
+ //===================================================================================================================
+ // revoke COM memory monitoring:
+ //===================================================================================================================
+class procedure TComAllocSpy.Fini;
+begin
+  // CoRevokeMallocSpy() returns E_ACCESSDENIED when there are outstanding allocations (not yet freed) made while this
+  // spy was active.
+  // Sadly, this is normal as combase.dll does not release some memory until it is unloaded during ExitProcess (which
+  // then finally calls Spy_Release).
+  CoRevokeMallocSpy;
 end;
 
 
@@ -1068,31 +1183,6 @@ const
 	RegisterExpectedMemoryLeak: MyRegisterExpectedMemoryLeak;
 	UnregisterExpectedMemoryLeak: MyUnregisterExpectedMemoryLeak;
   );
-
-  // VMT of a COM class implementing IMallocSpy:
-  IMallocSpyVMT: array [0..14] of Pointer =
-  (
-	@Spy_QueryInterface,		// IUnknown.QueryInterface
-	@Spy_AddRef,				// IUnknown._AddRef
-	@Spy_Release,				// IUnknown._Release
-	@Spy_PreAlloc,
-	@Spy_PostAlloc,
-	@Spy_PreFree,
-	@Spy_PostFree,
-	@Spy_PreRealloc,
-	@Spy_PostRealloc,
-	@Spy_PreGetSize,
-	@Spy_PostGetSize,
-	@Spy_PreDidAlloc,
-	@Spy_PostDidAlloc,
-	@Spy_NoopHeapMinimize,		// IMallocSpy.PreHeapMinimize
-	@Spy_NoopHeapMinimize		// IMallocSpy.PostHeapMinimize
-  );
-
-  // static singleton COM object which contains the VMT pointer as the only instance field:
-  MallocSpyObj: record VMT: Pointer; end = (VMT: @IMallocSpyVMT);
-
-  COINIT_APARTMENTTHREADED  = 2;      // Apartment model
 begin
   Assert(NoMemoryAllocated, 'Memory already allocated');
 
@@ -1100,12 +1190,8 @@ begin
   GetMemoryManager(OldMgr);
   SetMemoryManager(MemMgr);
 
-  // turn off the BSTR cache in oleaut32.dll (runs slower, but makes allocations deterministic):
-  // https://devblogs.microsoft.com/oldnewthing/20150107-00/?p=43203
-  SetOaNoCache;
-
   // install COM memory monitoring:
-  CoRegisterMallocSpy(IMallocSpy(@MallocSpyObj));
+  TComAllocSpy.Init;
 end;
 
 
@@ -1116,15 +1202,15 @@ begin
   // report Delphi memory leaks:
   DelphiMem.CheckMemoryLeak(true);
 
-  // CoRevokeMallocSpy() returns E_ACCESSDENIED when there are outstanding allocations (not yet freed) made while this
-  // spy was active.
-  // Sadly, this is normal as combase.dll does not release some memory until it is unloaded during ExitProcess (which
-  // then finally calls Spy_Release).
-  CoRevokeMallocSpy();
-  //if CoRevokeMallocSpy() = E_ACCESSDENIED then ComMem.CheckMemoryLeak(false);
+  // revoke COM memory monitoring
+  TComAllocSpy.Fini;
 
   // call the previous exit procedure:
   if Assigned(PrevExitProcessProc) then PrevExitProcessProc();
+
+  // the usage of IMAllocSpy triggers a bug in combase.dll when some DLLs are unloaded during ExitProcess
+  // => skip any further DLL unloading:
+  Windows.TerminateProcess(Windows.GetCurrentProcess, System.ExitCode);
 end;
 
 
@@ -1148,7 +1234,7 @@ begin
   Result := true;
 end;
 
-procedure DumpAllocatedBlocks(const Filename: string);
+procedure DumpAllocatedBlocks(const Filename: string; WithHexDump: boolean = true);
 begin
   // nothing
 end;

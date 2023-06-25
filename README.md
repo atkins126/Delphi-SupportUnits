@@ -92,6 +92,20 @@ Addr=000000008000ef60  Size=49  PreKey=$fefefefefefefefe  PostKey=$efefefefefefe
 (Note the last two digits of PostKey.)
 
 
+Note on COM memory monitoring:
+
+First observed with Windows 10, the Windows-shipped ADO data driver 'Microsoft.Jet.OLEDB.4.0' seems
+to trigger a bug in the Windows COM library "combase.dll". This seems to be related somehow to threads created by this driver: If
+you just create an ADO object, and then close the program within a few minutes, you get an Access Violation during ExitProcess,
+called by System.pas as the very last step. If you wait long enough, until all threads except the main thread have terminated,
+no Access Violation happens. The stack trace of all the involved Windows components seems to indicate that the fault happens as part of the
+combase.dll COM sutddown operations, when the IMallocSpy interface was used at some point before. And it happens even when the
+IMallocSpy implementation is purely passing through all operations.
+As this all is pure Windows functionality, there is no direct way to mitigate it. To prevent this AV from popping up regularly, the MemTest shutdown now calls
+TerminateProcess, instead of letting System.pas to continue with ExitProcess. This is the very last operation of the Delphi app anyway,
+every execution thereafter is caused by DLL unloading and cleanup, is not controlled by Delphi, and can therefore be skipped safely
+in almost all cases.
+
 ## WinMemMgr
 
 Simple replacement for the built-in Delphi memory manager, by using the Windows Heap.

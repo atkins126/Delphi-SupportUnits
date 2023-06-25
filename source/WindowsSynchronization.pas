@@ -9,6 +9,7 @@ unit WindowsSynchronization;
   - TFileHandle: represents a handle for which the value INVALID_HANDLE_VALUE is invalid.
   - TEvent: represents a Windows event (https://docs.microsoft.com/en-us/windows/win32/sync/using-event-objects)
   - TWaitableTimer: represents a Timer (https://docs.microsoft.com/en-us/windows/win32/sync/using-waitable-timer-objects).
+  - TMutex: represents a Mutex (https://docs.microsoft.com/en-us/windows/win32/sync/using-mutex-objects).
 }
 
 
@@ -29,8 +30,9 @@ type
   strict protected
 	FHandle: THandle;
 
-	class function WaitMultiple(const Handles: array of THandle; MilliSecondsTimeout: uint32; WaitAll: boolean): integer;
   public
+	class function WaitMultiple(Count: uint32; HandleArr: PWOHandleArray; MilliSecondsTimeout: uint32; WaitAll: BOOL): integer; overload; static;
+	class function WaitMultiple(const ObjectArr: array of TWaitHandle; MilliSecondsTimeout: uint32; WaitAll: BOOL): integer; overload; static;
 
 	// Waits until either the timeout has expired or the Windows object has been set to 'signaled'.
 	// For {MilliSecondsTimeout} = 0 the state of the synchronization object is tested without waiting.
@@ -39,6 +41,14 @@ type
 	function Wait(MilliSecondsTimeout: uint32): boolean; overload;
 	function Wait(const Timeout: TTimeoutTime): boolean; overload;
 
+	// Waits until either the timeout has expired or one of the TWaitHandle objects has been set to 'signaled'.
+	// For {MilliSecondsTimeout} = 0 the state of the synchronization objects is tested without waiting.
+	// For {MilliSecondsTimeout} = INFINITE there is no timeout.
+	// Returns -1 on return due to timeout, else the index of the 'signaled' handle. If multiple handles are
+	// signaled at the same time, the handle with the smallest index is processed and its index is returned.
+	class function WaitAny(const Objects: array of TWaitHandle; MilliSecondsTimeout: uint32): integer; overload;
+	class function WaitAny(const Objects: array of TWaitHandle; const Timeout: TTimeoutTime): integer; overload;
+
 	// Waits until either the timeout has expired or one of the Windows objects has been set to 'signaled'.
 	// For {MilliSecondsTimeout} = 0 the state of the synchronization objects is tested without waiting.
 	// For {MilliSecondsTimeout} = INFINITE there is no timeout.
@@ -46,6 +56,13 @@ type
 	// signaled at the same time, the handle with the smallest index is processed and its index is returned.
 	class function WaitAny(const Handles: array of THandle; MilliSecondsTimeout: uint32): integer; overload;
 	class function WaitAny(const Handles: array of THandle; const Timeout: TTimeoutTime): integer; overload;
+
+	// Waits until either the timeout has expired or all of the TWaitHandle objects has been set to 'signaled'.
+	// For {MilliSecondsTimeout} = 0 the state of the synchronization objects is tested without waiting.
+	// For {MilliSecondsTimeout} = INFINITE there is no timeout.
+	// Returns false for timeout, else true.
+	class function WaitAll(const Objects: array of TWaitHandle; MilliSecondsTimeout: uint32): boolean; overload;
+	class function WaitAll(const Objects: array of TWaitHandle; const Timeout: TTimeoutTime): boolean; overload;
 
 	// Waits until either the timeout has expired or all of the Windows objects has been set to 'signaled'.
 	// For {MilliSecondsTimeout} = 0 the state of the synchronization objects is tested without waiting.
@@ -93,7 +110,7 @@ type
   end;
 
 
-  // How Create/Open functions work regarding named synchronization objects:
+  // How CreateNamed constructors work regarding named synchronization objects:
   THandleOpenMode = (
 	homOpen,			// the Windows object must already exist, otherwise an exception is thrown
 	homCreateNew,		// the Windows object must not yet exist, otherwise an exception is thrown
@@ -137,9 +154,6 @@ type
   TMutex = class(TNonFileHandle)
   public
 	// Creates an anonymous unowned Windows Mutex object.
-	// If {InitialOwner} is false, the object is signaled and not owned by any thread.
-	// If {InitialOwner} is true, the calling thread owns the newly created mutex and must later release it to allow
-	// other threads go grab it.
 	constructor Create;
 
 	// Createas a named unowned Windows Mutex object.
@@ -168,10 +182,10 @@ type
 	constructor Create(ManualReset: boolean);
 
 	// Starts or restarts the timer with the given parameters.
-	// FirstTimeMilliSeconds: If non-zero, the timer is set to 'not signaled'. It will become 'signaled' after this
+	// FirstTimeMilliSeconds: If non-zero, the timer is set to 'not signaled' and it will become 'signaled' after this
 	// time has elapsed; if zero, the timer is immediately set to 'signaled'.
 	// RepeatTimeMilliSeconds: If not zero, the timer is restarted automatically after each expiration.
-	// (without changing the signaled state).
+	// (this restart does not reset the signaled state).
 	procedure Start(FirstTimeMilliSeconds: uint32; RepeatTimeMilliSeconds: uint32 = 0);
 
 	// Stops the timer. The signaled state of the timer object is *not* changed.
@@ -193,28 +207,48 @@ uses
 
 const
   TicksPerMillisec = int64(10 * 1000);		// 100ns intervals per ms
-  TicksPerDay = 24 * 60 * 60 * 1000 * TicksPerMillisec;
 
 
 { TWaitHandle }
 
  //===================================================================================================================
- // Returns -1 for timeout, otherwise the index of the signaled handle.
+ // Returns -1 for timeout, otherwise the index of the signaled handle. If multiple handles are signaled, then the
+ // index of the first one in <HandleArr> is returned.
  // The wait is not "alertable". Abandoned mutexes are considered 'signaled'.
- // <Handles> must contain between 1 and 64 elements.
+ // <HandleArr> must contain between 1 and 64 elements, otherwise EOSSysError with ERROR_INVALID_PARAMETER is raised.
  //===================================================================================================================
-class function TWaitHandle.WaitMultiple(const Handles: array of THandle; MilliSecondsTimeout: uint32; WaitAll: boolean): integer;
-var
-  res: DWORD;
+class function TWaitHandle.WaitMultiple(Count: uint32; HandleArr: PWOHandleArray; MilliSecondsTimeout: uint32; WaitAll: BOOL): integer;
 begin
   // up to MAXIMUM_WAIT_OBJECTS handles:
-  res := Windows.WaitForMultipleObjects(System.Length(Handles), PWOHandleArray(@Handles[0]), WaitAll, MilliSecondsTimeout);
-  case res of
-  WAIT_OBJECT_0 .. WAIT_OBJECT_0 + MAXIMUM_WAIT_OBJECTS - 1:       exit(integer(res) - WAIT_OBJECT_0);
-  WAIT_ABANDONED_0 .. WAIT_ABANDONED_0 + MAXIMUM_WAIT_OBJECTS - 1: exit(integer(res) - WAIT_ABANDONED_0);
-  WAIT_TIMEOUT:       exit(-1);
+  DWORD(Result) := Windows.WaitForMultipleObjects(Count, HandleArr, WaitAll, MilliSecondsTimeout);
+  case Result of
+  WAIT_OBJECT_0 .. WAIT_OBJECT_0 + MAXIMUM_WAIT_OBJECTS - 1:       dec(Result, WAIT_OBJECT_0);
+  WAIT_ABANDONED_0 .. WAIT_ABANDONED_0 + MAXIMUM_WAIT_OBJECTS - 1: dec(Result, WAIT_ABANDONED_0);
+  WAIT_TIMEOUT:       Result := -1;
   else                raise EOSSysError.Create(Windows.GetLastError);
   end;
+end;
+
+
+ //===================================================================================================================
+ // Returns -1 for timeout, otherwise the index of the signaled object. If multiple objects are signaled, then the
+ // index of the first one in <ObjectArr> is returned.
+ // The wait is not "alertable". Abandoned mutexes are considered 'signaled'.
+ // <ObjectArr> must contain between 1 and 64 elements, otherwise EOSSysError with ERROR_INVALID_PARAMETER is raised.
+ //===================================================================================================================
+class function TWaitHandle.WaitMultiple(const ObjectArr: array of TWaitHandle; MilliSecondsTimeout: uint32; WaitAll: BOOL): integer;
+var
+  Handles: Windows.TWOHandleArray;
+  i: integer;
+begin
+  if System.Length(ObjectArr) > System.Length(Handles) then
+	raise EOSSysError.Create(ERROR_INVALID_PARAMETER);
+
+  for i := System.Length(ObjectArr) - 1 downto 0 do begin
+	Handles[i] := ObjectArr[i].FHandle;
+  end;
+
+  Result := TWaitHandle.WaitMultiple(System.Length(ObjectArr), @Handles, MilliSecondsTimeout, WaitAll);
 end;
 
 
@@ -223,8 +257,8 @@ end;
 function TWaitHandle.Wait(MilliSecondsTimeout: uint32): boolean;
 begin
   case Windows.WaitForSingleObject(FHandle, MilliSecondsTimeout) of
-  WAIT_OBJECT_0, WAIT_ABANDONED_0:    exit(true);
-  WAIT_TIMEOUT:                       exit(false);
+  WAIT_OBJECT_0, WAIT_ABANDONED_0:    Result := true;
+  WAIT_TIMEOUT:                       Result := false;
   else                                raise EOSSysError.Create(Windows.GetLastError);
   end;
 end;
@@ -250,7 +284,7 @@ end;
  //===================================================================================================================
 class function TWaitHandle.WaitAny(const Handles: array of THandle; MilliSecondsTimeout: uint32): integer;
 begin
-  Result := self.WaitMultiple(Handles, MilliSecondsTimeout, false);
+  Result := self.WaitMultiple(System.Length(Handles), Addr(Handles), MilliSecondsTimeout, false);
 end;
 
 
@@ -258,7 +292,7 @@ end;
  //===================================================================================================================
 class function TWaitHandle.WaitAny(const Handles: array of THandle; const Timeout: TTimeoutTime): integer;
 begin
-  Result := self.WaitAny(Handles, Timeout.AsMilliSecs);
+  Result := self.WaitMultiple(System.Length(Handles), Addr(Handles), Timeout.AsMilliSecs, false);
 end;
 
 
@@ -266,7 +300,7 @@ end;
  //===================================================================================================================
 class function TWaitHandle.WaitAll(const Handles: array of THandle; MilliSecondsTimeout: uint32): boolean;
 begin
-  Result := self.WaitMultiple(Handles, MilliSecondsTimeout, true) <> -1;
+  Result := self.WaitMultiple(System.Length(Handles), Addr(Handles), MilliSecondsTimeout, true) >= 0;
 end;
 
 
@@ -274,7 +308,39 @@ end;
  //===================================================================================================================
 class function TWaitHandle.WaitAll(const Handles: array of THandle; const Timeout: TTimeoutTime): boolean;
 begin
-  Result := self.WaitAll(Handles, Timeout.AsMilliSecs);
+  Result := self.WaitMultiple(System.Length(Handles), Addr(Handles), Timeout.AsMilliSecs, true) >= 0;
+end;
+
+
+ //===================================================================================================================
+ //===================================================================================================================
+class function TWaitHandle.WaitAny(const Objects: array of TWaitHandle; MilliSecondsTimeout: uint32): integer;
+begin
+  Result := self.WaitMultiple(Objects, MilliSecondsTimeout, false);
+end;
+
+
+ //===================================================================================================================
+ //===================================================================================================================
+class function TWaitHandle.WaitAny(const Objects: array of TWaitHandle; const Timeout: TTimeoutTime): integer;
+begin
+  Result := self.WaitMultiple(Objects, Timeout.AsMilliSecs, false);
+end;
+
+
+ //===================================================================================================================
+ //===================================================================================================================
+class function TWaitHandle.WaitAll(const Objects: array of TWaitHandle; MilliSecondsTimeout: uint32): boolean;
+begin
+  Result := self.WaitMultiple(Objects, MilliSecondsTimeout, true) >= 0;
+end;
+
+
+ //===================================================================================================================
+ //===================================================================================================================
+class function TWaitHandle.WaitAll(const Objects: array of TWaitHandle; const Timeout: TTimeoutTime): boolean;
+begin
+  Result := self.WaitMultiple(Objects, Timeout.AsMilliSecs, true) >= 0;
 end;
 
 
@@ -332,13 +398,29 @@ end;
 
 { TWaitableTimer }
 
+{$if not declared(CreateWaitableTimerEx)}
+function CreateWaitableTimerEx(
+	lpTimerAttributes: PSecurityAttributes;
+	lpTimerName: PChar;
+	dwFlags: DWORD;
+	dwDesiredAccess: DWORD
+  ): THandle; stdcall; external Windows.kernel32 name {$ifdef UNICODE}'CreateWaitableTimerExW'{$else}'CreateWaitableTimerExA'{$endif};
+{$ifend}
+
+const
+  TIMER_MODIFY_STATE      = $0002;
+  CREATE_WAITABLE_TIMER_MANUAL_RESET  = $00000001;
+
  //===================================================================================================================
  //===================================================================================================================
 constructor TWaitableTimer.Create(ManualReset: boolean);
 var
+  Flags: DWORD;
   Handle: THandle;
 begin
-  Handle := Windows.CreateWaitableTimer(nil, ManualReset, nil);
+  Flags := 0;
+  if ManualReset then Flags := Flags or CREATE_WAITABLE_TIMER_MANUAL_RESET;
+  Handle := CreateWaitableTimerEx(nil, nil, Flags, SYNCHRONIZE or TIMER_MODIFY_STATE);
   inherited Create(Handle, Windows.GetLastError);
 end;
 
@@ -366,12 +448,14 @@ end;
  //===================================================================================================================
  //===================================================================================================================
 procedure TWaitableTimer.Reset;
+const
+  TicksPerDay = 24 * 60 * 60 * 1000 * TicksPerMillisec;
 var
   DueTimeArg: int64;
 begin
   DueTimeArg := -TicksPerDay;
 
-  // to reset the signaled state, a non-null dummy period must be set briefly:
+  // to reset the signaled state (without signaling it when currently non-signaled!), a non-null dummy period must be set briefly:
   Win32Check(
 		Windows.SetWaitableTimer(FHandle, DueTimeArg, 0, nil, nil, false)
 	and Windows.CancelWaitableTimer(FHandle)
@@ -381,7 +465,7 @@ end;
 
 { TEvent }
 
-{$if not declared (CreateEventEx)}
+{$if not declared(CreateEventEx)}
 function CreateEventEx(
 	lpMutexAttributes: PSecurityAttributes;
 	lpName: PChar;
@@ -454,14 +538,13 @@ end;
 
 { TMutex }
 
-{$if not declared (CreateMutexEx)}
+// better prototype than in WinApi.Windows:
 function CreateMutexEx(
 	lpMutexAttributes: PSecurityAttributes;
 	lpName: PChar;
 	dwFlags: DWORD;
 	dwDesiredAccess: DWORD
   ): THandle; stdcall; external Windows.kernel32 name {$ifdef UNICODE}'CreateMutexExW'{$else}'CreateMutexExA'{$endif};
-{$ifend}
 
 
  //===================================================================================================================
@@ -516,6 +599,5 @@ procedure TMutex.Release;
 begin
   Win32Check( Windows.ReleaseMutex(FHandle) );
 end;
-
 
 end.
